@@ -17,45 +17,47 @@
 
 #include "whitelister.skel.h"
 
-#define MAX_PATH       256
-#define TASK_COMM_LEN  16
-#define MAX_PREFIXES   8
+#define MAX_PATH 256
+#define TASK_COMM_LEN 16
+#define MAX_PREFIXES 8
 
 struct config {
-    char     target_comm[TASK_COMM_LEN];
+    char target_comm[TASK_COMM_LEN];
     uint32_t num_prefixes;
     uint32_t prefix_lens[MAX_PREFIXES];
-    char     prefixes[MAX_PREFIXES][MAX_PATH];
+    char prefixes[MAX_PREFIXES][MAX_PATH];
 };
 
 static volatile sig_atomic_t stop;
-static void sig_handler(int _) { (void)_; stop = 1; }
+static void sig_handler(int _) {
+    (void)_;
+    stop = 1;
+}
 
-static int libbpf_print_fn(enum libbpf_print_level level,
-                           const char *fmt, va_list args)
-{
-    if (level == LIBBPF_DEBUG) return 0;
+static int libbpf_print_fn(enum libbpf_print_level level, const char *fmt,
+                           va_list args) {
+    if (level == LIBBPF_DEBUG)
+        return 0;
     return vfprintf(stderr, fmt, args);
 }
 
-static void usage(const char *prog)
-{
+static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s --comm <name> --allow <path> [--allow <path> ...]\n"
-        "\n"
-        "  --comm   target process name (as shown in task->comm, 15 chars max)\n"
-        "  --allow  allowed path prefix (repeatable, up to %d total)\n"
-        "\n"
-        "Example (confining FTP to /srv/ftp):\n"
-        "  sudo %s --comm vsftpd \\\n"
-        "       --allow /srv/ftp \\\n"
-        "       --allow /lib --allow /lib64 --allow /usr \\\n"
-        "       --allow /etc --allow /proc --allow /dev\n",
-        prog, MAX_PREFIXES, prog);
+            "Usage: %s --comm <name> --allow <path> [--allow <path> ...]\n"
+            "\n"
+            "  --comm   target process name (as shown in task->comm, 15 chars "
+            "max)\n"
+            "  --allow  allowed path prefix (repeatable, up to %d total)\n"
+            "\n"
+            "Example (confining FTP to /srv/ftp):\n"
+            "  sudo %s --comm vsftpd \\\n"
+            "       --allow /srv/ftp \\\n"
+            "       --allow /lib --allow /lib64 --allow /usr \\\n"
+            "       --allow /etc --allow /proc --allow /dev\n",
+            prog, MAX_PREFIXES, prog);
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     struct config cfg = {};
 
     for (int i = 1; i < argc; i++) {
@@ -75,7 +77,8 @@ int main(int argc, char **argv)
             }
             const char *p = argv[++i];
             size_t len = strlen(p);
-            while (len > 1 && p[len - 1] == '/') len--;
+            while (len > 1 && p[len - 1] == '/')
+                len--;
             if (len == 0 || len >= MAX_PATH) {
                 fprintf(stderr, "error: bad path length: %s\n", p);
                 return 1;
@@ -130,14 +133,16 @@ int main(int argc, char **argv)
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("[whitelister] active  comm=\"%s\"  prefixes=%u\n",
-           cfg.target_comm, cfg.num_prefixes);
+    printf("[whitelister] active  comm=\"%s\"  prefixes=%u\n", cfg.target_comm,
+           cfg.num_prefixes);
     for (uint32_t i = 0; i < cfg.num_prefixes; i++)
         printf("              allow  %s\n", cfg.prefixes[i]);
-    printf("[whitelister] denials: sudo cat /sys/kernel/debug/tracing/trace_pipe\n");
+    printf("[whitelister] denials: sudo cat "
+           "/sys/kernel/debug/tracing/trace_pipe\n");
     printf("[whitelister] Ctrl+C to stop\n");
 
-    while (!stop) sleep(1);
+    while (!stop)
+        sleep(1);
 
     printf("\n[whitelister] detaching\n");
     whitelister_bpf__destroy(skel);

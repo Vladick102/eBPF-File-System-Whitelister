@@ -15,7 +15,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEMO_DIR=/tmp/ftp_whitelist_demo
 FAKE_FTP=/tmp/ftp
 
-die()  { echo "error: $*" >&2; exit 1; }
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
 info() { echo "[*] $*"; }
 warn() { echo "[!] $*" >&2; }
 
@@ -30,9 +33,9 @@ cmd_deps() {
     apt-get install -y \
         clang llvm \
         libbpf-dev libelf-dev zlib1g-dev \
-        bpftool linux-headers-"$(uname -r)" linux-tools-"$(uname -r)" \
-        || apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev \
-                              bpftool linux-headers-"$(uname -r)"
+        bpftool linux-headers-"$(uname -r)" linux-tools-"$(uname -r)" ||
+        apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev \
+            bpftool linux-headers-"$(uname -r)"
     info "dependencies installed"
 }
 
@@ -46,32 +49,21 @@ cmd_check() {
         warn "CONFIG_BPF_LSM=y not confirmed (kernel may still support it)"
     fi
 
-    [[ -r /sys/kernel/security/lsm ]] \
-        || die "/sys/kernel/security/lsm unreadable (securityfs not mounted?)"
+    [[ -r /sys/kernel/security/lsm ]] ||
+        die "/sys/kernel/security/lsm unreadable"
 
     local lsms
     lsms="$(cat /sys/kernel/security/lsm)"
     info "active LSMs: $lsms"
 
     if [[ ",$lsms," == *",bpf,"* ]]; then
-        info "bpf is in the LSM chain — you're good to go"
+        info "bpf is in the LSM chain"
         return 0
     fi
 
     cat >&2 <<EOF
 
 [!] 'bpf' is NOT in the active LSM chain — the whitelister will fail to attach.
-
-To enable BPF LSM on Ubuntu/Debian:
-
-  1) Edit /etc/default/grub and add 'lsm=...' to GRUB_CMDLINE_LINUX_DEFAULT,
-     appending 'bpf' to the list of current LSMs. For your system:
-
-       GRUB_CMDLINE_LINUX_DEFAULT="quiet splash lsm=${lsms},bpf"
-
-  2) sudo update-grub
-  3) reboot
-  4) re-run:  $0 check
 
 EOF
     exit 1
@@ -90,16 +82,13 @@ cmd_demo() {
     info "creating demo files under $DEMO_DIR ..."
     rm -rf "$DEMO_DIR"
     mkdir -p "$DEMO_DIR/allowed"
-    echo "this file is inside the whitelist, ftp may read it"  > "$DEMO_DIR/allowed/public.txt"
-    echo "this file is SECRET — a well-behaved ftp must NOT read it" > "$DEMO_DIR/secret.txt"
+    echo "this file is inside the whitelist, ftp may read it" >"$DEMO_DIR/allowed/public.txt"
+    echo "this file is SECRET" >"$DEMO_DIR/secret.txt"
     chmod -R a+rX "$DEMO_DIR"
 
     info "building a minimal 'ftp' reader binary at $FAKE_FTP ..."
-    # Tiny standalone reader, named literally "ftp" so task->comm == "ftp"
-    # without any argv[0]-spoofing tricks (which fail on multi-call
-    # coreutils binaries on Ubuntu 25.10+).
     local src=/tmp/ftp_reader.c
-    cat > "$src" <<'EOS'
+    cat >"$src" <<'EOS'
 #include <stdio.h>
 #include <stdlib.h>
 int main(int argc, char **argv) {
@@ -119,7 +108,7 @@ EOS
 
 --- demo ready ---
 
-Terminal A — start the whitelister (run as root):
+Terminal A — start the whitelister:
 
   sudo $SCRIPT_DIR/build/whitelister --comm ftp \\
        --allow $DEMO_DIR/allowed \\
@@ -145,12 +134,17 @@ EOF
 
 sub="${1:-all}"
 case "$sub" in
-    deps)  cmd_deps  ;;
+    deps) cmd_deps ;;
     check) cmd_check ;;
     build) cmd_build ;;
-    demo)  cmd_demo  ;;
-    all)   cmd_deps; cmd_check; cmd_build; cmd_demo ;;
-    -h|--help|help)
+    demo) cmd_demo ;;
+    all)
+        cmd_deps
+        cmd_check
+        cmd_build
+        cmd_demo
+        ;;
+    -h | --help | help)
         sed -n '2,15p' "$0"
         ;;
     *) die "unknown subcommand: $sub (try '$0 help')" ;;
