@@ -17,7 +17,10 @@
 
 #include "whitelister.skel.h"
 
-#define MAX_PATH 256
+// Must match MAX_PATH in whitelister.bpf.c. The struct laid out below is
+// pushed verbatim into the kernel via bpf_map_update_elem(), so any drift
+// here vs. the BPF program corrupts the map contents.
+#define MAX_PATH 1024
 #define TASK_COMM_LEN 16
 #define MAX_PREFIXES 8
 
@@ -140,6 +143,7 @@ int main(int argc, char **argv) {
     printf("[whitelister] denials: sudo cat "
            "/sys/kernel/debug/tracing/trace_pipe\n");
     printf("[whitelister] Ctrl+C to stop\n");
+    fflush(stdout);
 
     while (!stop)
         sleep(1);
