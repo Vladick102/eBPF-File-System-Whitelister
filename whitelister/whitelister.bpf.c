@@ -17,7 +17,7 @@
 #define MAX_PREFIXES 8
 
 struct config {
-    p char target_comm[TASK_COMM_LEN];
+    char target_comm[TASK_COMM_LEN];
     __u32 num_prefixes;
     __u32 prefix_lens[MAX_PREFIXES];
     char prefixes[MAX_PREFIXES][MAX_PATH];
