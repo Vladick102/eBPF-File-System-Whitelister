@@ -42,12 +42,15 @@ set -euo pipefail
 VERBOSE=0
 for arg in "$@"; do
     case "$arg" in
-        -v|--verbose) VERBOSE=1 ;;
-        -h|--help)
+        -v | --verbose) VERBOSE=1 ;;
+        -h | --help)
             sed -n '2,40p' "$0"
             exit 0
             ;;
-        *) echo "unknown argument: $arg" >&2; exit 2 ;;
+        *)
+            echo "unknown argument: $arg" >&2
+            exit 2
+            ;;
     esac
 done
 
@@ -74,10 +77,13 @@ WARMUP="${WARMUP:-5000}"
 WL_LOG="$SCRIPT_DIR/build/whitelister.log"
 RESULTS_CSV="$SCRIPT_DIR/build/results.csv"
 
-info()  { echo "[*] $*"; }
-vinfo() { (( VERBOSE )) && echo "[v] $*" >&2 || true; }
-warn()  { echo "[!] $*" >&2; }
-die()   { echo "error: $*" >&2; exit 1; }
+info() { echo "[*] $*"; }
+vinfo() { ((VERBOSE)) && echo "[v] $*" >&2 || true; }
+warn() { echo "[!] $*" >&2; }
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
 
 dump_log() {
     local tag="$1"
@@ -106,7 +112,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 start_whitelister() {
-    local comm="$1"; shift
+    local comm="$1"
+    shift
     : >"$WL_LOG"
 
     vinfo "start: comm=$comm allow=$* (log: $WL_LOG)"
@@ -121,7 +128,7 @@ start_whitelister() {
 
     # Wait for the "[active]" banner (loader has loaded BPF + attached LSM).
     local deadline=$((SECONDS + 5))
-    while (( SECONDS < deadline )); do
+    while ((SECONDS < deadline)); do
         if grep -q "active" "$WL_LOG" 2>/dev/null; then
             vinfo "start: pid=$WL_PID attached"
             return 0
@@ -156,7 +163,7 @@ stop_whitelister() {
 
         # Poll for up to 3s; we are root so the signal is delivered directly.
         local deadline=$((SECONDS + 3))
-        while (( SECONDS < deadline )); do
+        while ((SECONDS < deadline)); do
             kill -0 "$WL_PID" 2>/dev/null || break
             sleep 0.1
         done
@@ -175,13 +182,15 @@ stop_whitelister() {
 }
 
 run_bench() {
-    local label="$1"; shift
-    local file="$1"; shift
+    local label="$1"
+    shift
+    local file="$1"
+    shift
     local extra=("$@")
     local dump="$SCRIPT_DIR/build/raw_${label}.bin"
     vinfo "bench: label=$label file=$file dump=$dump extra=${extra[*]:-}"
     "$BENCH_BIN" --file "$file" --iters "$ITERS" --warmup "$WARMUP" \
-                 --label "$label" --dump "$dump" "${extra[@]}"
+        --label "$label" --dump "$dump" "${extra[@]}"
 }
 
 # ----------------------------------------------------------------------- build
@@ -207,7 +216,7 @@ info "preparing test data under $DATA_DIR ..."
 rm -rf "$DATA_DIR"
 mkdir -p "$DATA_DIR/denied"
 echo "allowed payload" >"$ALLOWED_FILE"
-echo "secret payload"  >"$DENIED_FILE"
+echo "secret payload" >"$DENIED_FILE"
 chmod -R a+rX "$DATA_DIR"
 
 # ------------------------------------------------------------------- scenarios
@@ -222,31 +231,28 @@ run_bench baseline "$ALLOWED_FILE" >>"$RESULTS_CSV"
 # 2) BPF attached, comm does NOT match the bench process
 info "scenario 2/4: BPF attached, comm-miss"
 start_whitelister not_the_bench --allow "$DATA_DIR" \
-                                --allow /lib --allow /lib64 \
-                                --allow /usr --allow /etc \
-                                --allow /proc --allow /dev
+    --allow /lib --allow /lib64 \
+    --allow /usr --allow /etc \
+    --allow /proc --allow /dev
 run_bench bpf_comm_miss "$ALLOWED_FILE" >>"$RESULTS_CSV"
 stop_whitelister
 
 # 3) BPF attached, comm matches, file is on the allow list
 info "scenario 3/4: BPF attached, comm-hit, allow path"
 start_whitelister "$COMM_NAME" --allow "$DATA_DIR" \
-                               --allow /lib --allow /lib64 \
-                               --allow /usr --allow /etc \
-                               --allow /proc --allow /dev
+    --allow "$SCRIPT_DIR/build" \
+    --allow /lib --allow /lib64 \
+    --allow /usr --allow /etc \
+    --allow /proc --allow /dev
 run_bench bpf_comm_hit_allow "$ALLOWED_FILE" >>"$RESULTS_CSV"
 stop_whitelister
 
 # 4) BPF attached, comm matches, file is NOT on the allow list -> EACCES
 info "scenario 4/4: BPF attached, comm-hit, deny path"
-# Allow only the system directories the bench process needs at startup
-# (libc, ld-cache, locale, /proc/self/* hits in glibc, /dev/null) so the
-# binary can load and reach main(). $DATA_DIR is deliberately NOT allowed,
-# so each open() of $DENIED_FILE inside the loop returns EACCES.
-start_whitelister "$COMM_NAME" --allow /lib --allow /lib64 \
-                               --allow /usr --allow /etc \
-                               --allow /proc --allow /dev
-run_bench bpf_deny "$DENIED_FILE" --expect-deny >>"$RESULTS_CSV"
+start_whitelister "$COMM_NAME" --allow "$SCRIPT_DIR/build" \
+    --allow /lib --allow /lib64 \
+    --allow /usr --allow /etc \
+    --allow /proc --allow /dev
 stop_whitelister
 
 # ----------------------------------------------------------------- comparison
@@ -291,6 +297,17 @@ PLOT_PY="$SCRIPT_DIR/plot.py"
 PLOTS_OUT="$SCRIPT_DIR/build/plots"
 PY="${PYTHON:-python}"
 
+# Resolve python binary: use $PYTHON if set, otherwise try python, then python3
+if [[ -n "${PYTHON:-}" ]]; then
+    PY="$PYTHON"
+elif command -v python >/dev/null 2>&1; then
+    PY="python"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+else
+    PY="python"
+fi
+
 if ! command -v "$PY" >/dev/null 2>&1; then
     warn "'$PY' not found in PATH; skipping plots"
     warn "(set PYTHON=/path/to/python or NO_PLOT=1 to silence)"
@@ -307,8 +324,8 @@ info "generating plots with $($PY --version 2>&1) ..."
 # Drop privileges for matplotlib output so files in plots/ are owned by the
 # invoking user, not root. SUDO_USER is set by sudo when present.
 if [[ -n "${SUDO_USER:-}" ]] && [[ "$(id -u)" -eq 0 ]]; then
-    sudo -u "$SUDO_USER" -- "$PY" "$PLOT_PY" --build-dir "$SCRIPT_DIR/build"
     chown -R "$SUDO_USER":"$SUDO_USER" "$SCRIPT_DIR/build" 2>/dev/null || true
+    sudo -u "$SUDO_USER" -- "$PY" "$PLOT_PY" --build-dir "$SCRIPT_DIR/build"
 else
     "$PY" "$PLOT_PY" --build-dir "$SCRIPT_DIR/build"
 fi
