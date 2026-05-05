@@ -22,7 +22,8 @@
 // here vs. the BPF program corrupts the map contents.
 #define MAX_PATH 1024
 #define TASK_COMM_LEN 16
-#define MAX_PREFIXES 8
+// Must match MAX_PREFIXES in whitelister.bpf.c.
+#define MAX_PREFIXES 32
 
 struct config {
     char target_comm[TASK_COMM_LEN];

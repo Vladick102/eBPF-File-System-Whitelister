@@ -1,41 +1,53 @@
 #!/usr/bin/env bash
-# Runs the open()/close() microbenchmark in four configurations and prints a
-# side-by-side comparison so the cost of the eBPF LSM hook is visible.
+# Sweep the eBPF whitelister's per-open() latency as a function of the
+# number of allow-list entries.
 #
-# Scenarios:
+# For each scenario in (baseline, bpf_comm_miss, bpf_comm_hit_allow, bpf_deny)
+# and each allow-list size N in NS (default {1, 4, 7, ..., 25}), we run the
+# open() microbenchmark
+# REPEATS times, take the per-run p50, and aggregate (mean, stddev) across
+# the repeats. The repeats average out cross-run system noise (scheduler
+# preemption, cache state, IRQ jitter) so the curves are representative
+# rather than dominated by the variance of a single run.
 #
-#   baseline       no whitelister attached      -> raw VFS open() cost
-#   bpf_comm_miss  whitelister attached, --comm set to a name that does NOT
-#                  match the bench binary       -> overhead = LSM dispatch
-#                                                  + bpf_get_current_comm
-#                                                  + comm mismatch early-out
-#   bpf_comm_hit   whitelister attached, --comm matches the bench binary,
-#                  target file under an --allow prefix
-#                                              -> overhead = LSM dispatch
-#                                                  + comm match
-#                                                  + bpf_d_path()
-#                                                  + prefix scan (1 iter)
-#   bpf_deny       whitelister attached, --comm matches the bench binary,
-#                  target file NOT under any --allow prefix
-#                                              -> overhead = full deny path
-#                                                  (open() returns EACCES)
+# Trick to free up allow-list slots: bench_open does prctl(PR_SET_NAME)
+# *after* all libc / ld.so loads, so the whitelister's --comm filter only
+# matches the warmup + timed phase. That means we never have to allow
+# /lib, /lib64, /usr, /etc, ... and the full MAX_PREFIXES budget is
+# usable for the actual sweep.
 #
-# The bench binary is symlinked under a deterministic 15-char name
-# ("wlbench_target") so we can wire it up to --comm reliably, since
-# task->comm is truncated at 15 bytes.
+# Allow-list shape per scenario (N total entries):
 #
-# This script must be run as root: it loads a BPF program and writes test
-# data under /tmp. We do NOT call sudo internally because the surrounding
-# sudo (sudo-rs in particular) does not reliably forward SIGINT to the
-# loader when stdout is redirected, and stop_whitelister hangs waiting on
-# a child that never receives the signal.
+#   baseline            no whitelister attached, N has no meaning
+#                       (replicated across N for plotting convenience)
+#
+#   bpf_comm_miss       --comm does NOT match the bench process; allow-list
+#                       contains (N-1) decoys + the target prefix, but the
+#                       prefix scan never runs (early-out on comm mismatch).
+#                       Cost should be flat in N.
+#
+#   bpf_comm_hit_allow  --comm matches; (N-1) non-matching decoys followed
+#                       by the target prefix LAST in the allow-list.
+#                       Worst-case scan: visits all N entries before
+#                       matching the last one. Cost ~ N * (per-entry cost).
+#
+#   bpf_deny            --comm matches; allow-list is N decoys, target file
+#                       is NOT under any prefix -> full scan + EACCES.
+#                       Cost ~ N * (per-entry cost) + deny path.
+#
+# Output:
+#   build/sweep.csv                                summary stats
+#   build/plots/latency_vs_allowlist.png           latency vs N (line + band)
+#   build/plots/overhead_vs_allowlist.png          delta over baseline vs N
 #
 # Usage:
 #   sudo ./run_bench.sh [-v|--verbose]
 #
 # Env knobs:
-#   ITERS    iterations per scenario             (default 50000)
-#   WARMUP   warmup opens per scenario           (default 2000)
+#   ITERS    timed open() iterations per single bench_open run  (default 10000)
+#   WARMUP   warmup opens per single run                         (default 1000)
+#   REPEATS  independent bench_open invocations per (scen, N)    (default 30)
+#   NS       allow-list sizes to sweep (space-separated)         (default 1..8)
 
 set -euo pipefail
 
@@ -44,7 +56,7 @@ for arg in "$@"; do
     case "$arg" in
         -v | --verbose) VERBOSE=1 ;;
         -h | --help)
-            sed -n '2,40p' "$0"
+            sed -n '2,52p' "$0"
             exit 0
             ;;
         *)
@@ -63,19 +75,26 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-BENCH_BIN_REAL="$SCRIPT_DIR/build/bench_open"
-COMM_NAME="wlbench_target"
-BENCH_BIN="$SCRIPT_DIR/build/$COMM_NAME"
+BENCH_BIN="$SCRIPT_DIR/build/bench_open"
 WHITELISTER="$PROJECT_DIR/build/whitelister"
+COMM_NAME="wlbench_target"   # set via prctl inside bench_open (<=15 bytes)
 
 DATA_DIR=/tmp/whitelister_bench
 ALLOWED_FILE="$DATA_DIR/allowed.txt"
 DENIED_FILE="$DATA_DIR/denied/secret.txt"
 
-ITERS="${ITERS:-100000}"
-WARMUP="${WARMUP:-5000}"
 WL_LOG="$SCRIPT_DIR/build/whitelister.log"
-RESULTS_CSV="$SCRIPT_DIR/build/results.csv"
+SWEEP_CSV="$SCRIPT_DIR/build/sweep.csv"
+PLOT_PY="$SCRIPT_DIR/plot.py"
+PLOTS_OUT="$SCRIPT_DIR/build/plots"
+
+ITERS="${ITERS:-10000}"
+WARMUP="${WARMUP:-1000}"
+REPEATS="${REPEATS:-30}"
+# Sweep up to 25 entries. MAX_PREFIXES in whitelister.bpf.c is 32, so this
+# leaves a small safety margin without needing to rebuild the BPF program.
+# Step of 3 -> 9 evenly-spaced points; tweak via NS=... to taste.
+NS="${NS:-1 4 7 10 13 16 19 22 25}"
 
 info() { echo "[*] $*"; }
 vinfo() { ((VERBOSE)) && echo "[v] $*" >&2 || true; }
@@ -85,20 +104,9 @@ die() {
     exit 1
 }
 
-dump_log() {
-    local tag="$1"
-    if [[ -s "$WL_LOG" ]]; then
-        echo "--- whitelister log ($tag) ---" >&2
-        cat "$WL_LOG" >&2
-        echo "--- end log ---" >&2
-    fi
-}
-
 cleanup() {
     if [[ -n "${WL_PID:-}" ]] && kill -0 "$WL_PID" 2>/dev/null; then
-        vinfo "cleanup: killing leftover whitelister pid=$WL_PID"
         kill -INT "$WL_PID" 2>/dev/null || true
-        # give it a chance, then escalate
         for _ in 1 2 3 4 5 6 7 8 9 10; do
             kill -0 "$WL_PID" 2>/dev/null || break
             sleep 0.1
@@ -106,7 +114,6 @@ cleanup() {
         kill -KILL "$WL_PID" 2>/dev/null || true
         wait "$WL_PID" 2>/dev/null || true
     fi
-    # paranoia: make sure no stray whitelister survived the run
     pkill -KILL -f "$WHITELISTER" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -115,101 +122,110 @@ start_whitelister() {
     local comm="$1"
     shift
     : >"$WL_LOG"
-
-    vinfo "start: comm=$comm allow=$* (log: $WL_LOG)"
-
-    # stdbuf -oL forces the loader's stdout to line-buffered mode so the
-    # "[active]" banner reaches the file as soon as it is printed (older
-    # loader binaries that block-buffer printf would otherwise hold the
-    # banner until exit and break the readiness probe below).
+    vinfo "loader: comm=$comm allow=$*"
     stdbuf -oL "$WHITELISTER" --comm "$comm" "$@" >"$WL_LOG" 2>&1 &
     WL_PID=$!
-    vinfo "start: pid=$WL_PID"
-
-    # Wait for the "[active]" banner (loader has loaded BPF + attached LSM).
     local deadline=$((SECONDS + 5))
     while ((SECONDS < deadline)); do
-        if grep -q "active" "$WL_LOG" 2>/dev/null; then
-            vinfo "start: pid=$WL_PID attached"
-            return 0
-        fi
-        if ! kill -0 "$WL_PID" 2>/dev/null; then
-            dump_log "exit during startup"
-            die "whitelister exited during startup"
-        fi
+        grep -q "active" "$WL_LOG" 2>/dev/null && return 0
+        kill -0 "$WL_PID" 2>/dev/null || {
+            cat "$WL_LOG" >&2
+            die "loader exited"
+        }
         sleep 0.1
     done
-
-    # Fallback: process is still alive past the deadline. Either the BPF
-    # attach actually took >5s, or the loader binary is buffering stdout.
-    # If it is alive, libbpf has loaded successfully (load failure exits
-    # immediately).
     if kill -0 "$WL_PID" 2>/dev/null; then
-        warn "whitelister still running after 5s but banner not seen -- assuming attached"
+        warn "loader: no banner after 5s, assuming attached"
         return 0
     fi
-    dump_log "no banner, no process"
-    die "whitelister failed to start"
+    cat "$WL_LOG" >&2
+    die "loader failed to start"
 }
 
 stop_whitelister() {
-    if [[ -z "${WL_PID:-}" ]]; then
-        return 0
-    fi
-
+    [[ -z "${WL_PID:-}" ]] && return 0
     if kill -0 "$WL_PID" 2>/dev/null; then
-        vinfo "stop: SIGINT -> pid=$WL_PID"
         kill -INT "$WL_PID" 2>/dev/null || true
-
-        # Poll for up to 3s; we are root so the signal is delivered directly.
         local deadline=$((SECONDS + 3))
         while ((SECONDS < deadline)); do
             kill -0 "$WL_PID" 2>/dev/null || break
             sleep 0.1
         done
-
-        if kill -0 "$WL_PID" 2>/dev/null; then
-            warn "stop: pid=$WL_PID did not exit on SIGINT, escalating to SIGKILL"
-            kill -KILL "$WL_PID" 2>/dev/null || true
-        fi
+        kill -0 "$WL_PID" 2>/dev/null && kill -KILL "$WL_PID" 2>/dev/null || true
     fi
-
     wait "$WL_PID" 2>/dev/null || true
-    vinfo "stop: pid=$WL_PID reaped"
     WL_PID=
-    # let the kernel actually drop the program before the next attach
     sleep 0.3
 }
 
-run_bench() {
-    local label="$1"
-    shift
-    local file="$1"
-    shift
+# Run one bench_open invocation, echo its p50_ns (column 6 of the CSV record).
+run_one() {
+    local label="$1" file="$2"
+    shift 2
     local extra=("$@")
-    local dump="$SCRIPT_DIR/build/raw_${label}.bin"
-    vinfo "bench: label=$label file=$file dump=$dump extra=${extra[*]:-}"
-    "$BENCH_BIN" --file "$file" --iters "$ITERS" --warmup "$WARMUP" \
-        --label "$label" --dump "$dump" "${extra[@]}"
+    local out
+    out=$("$BENCH_BIN" --file "$file" --iters "$ITERS" --warmup "$WARMUP" \
+        --label "$label" --set-comm "$COMM_NAME" \
+        "${extra[@]}" 2>/dev/null)
+    # CSV: label,iters,mean,stddev,min,p50,p90,p99,p999,max
+    echo "$out" | cut -d, -f6
+}
+
+# Aggregate stats over a list of numeric samples on stdin.
+# Echoes "mean,stddev,min,max" (mean / stddev with 2 decimals, min / max as ints).
+aggregate() {
+    awk '
+    NR == 1 { mn = mx = $1 }
+    {
+        s += $1; ss += $1 * $1; n++
+        if ($1 < mn) mn = $1
+        if ($1 > mx) mx = $1
+    }
+    END {
+        if (n == 0) { print "0,0,0,0"; exit }
+        mean = s / n
+        var  = (ss - s * s / n) / n
+        sd   = (var < 0) ? 0 : sqrt(var)
+        printf "%.2f,%.2f,%.0f,%.0f", mean, sd, mn, mx
+    }'
+}
+
+# Run REPEATS bench_opens, append one aggregate row to sweep.csv.
+sweep_point() {
+    local scenario="$1" n="$2" file="$3"
+    shift 3
+    local extra=("$@")
+    local p50s=()
+    for ((r = 1; r <= REPEATS; r++)); do
+        local p50
+        p50=$(run_one "${scenario}_n${n}_r${r}" "$file" "${extra[@]}")
+        p50s+=("$p50")
+    done
+    local stats
+    stats=$(printf '%s\n' "${p50s[@]}" | aggregate)
+    echo "$scenario,$n,$REPEATS,$stats" >>"$SWEEP_CSV"
+    info "  $scenario n=$n -> mean=$(echo "$stats" | cut -d, -f1)ns ± $(echo "$stats" | cut -d, -f2)ns"
+}
+
+# Emit `--allow <decoy>` flags on stdout, $1 of them, deterministic paths.
+gen_decoys() {
+    local count="$1"
+    for ((i = 0; i < count; i++)); do
+        printf -- '--allow\n'
+        printf -- '/__bench_decoy/pad%05d\n' "$i"
+    done
 }
 
 # ----------------------------------------------------------------------- build
 info "building bench_open ..."
 make -C "$SCRIPT_DIR" >/dev/null
-
-[[ -x "$BENCH_BIN_REAL" ]] || die "bench_open did not build"
-
-# Symlink so the running process has comm == wlbench_target (<=15 bytes).
-ln -sf "$(basename "$BENCH_BIN_REAL")" "$BENCH_BIN"
-vinfo "bench binary: $BENCH_BIN -> $(basename "$BENCH_BIN_REAL")"
+[[ -x "$BENCH_BIN" ]] || die "bench_open did not build"
 
 if [[ ! -x "$WHITELISTER" ]]; then
-    warn "whitelister binary not found at $WHITELISTER"
-    info "building it ..."
+    info "building whitelister ..."
     make -C "$PROJECT_DIR"
 fi
 [[ -x "$WHITELISTER" ]] || die "could not build whitelister"
-vinfo "whitelister binary: $WHITELISTER"
 
 # ------------------------------------------------------------------- test data
 info "preparing test data under $DATA_DIR ..."
@@ -219,110 +235,92 @@ echo "allowed payload" >"$ALLOWED_FILE"
 echo "secret payload" >"$DENIED_FILE"
 chmod -R a+rX "$DATA_DIR"
 
-# ------------------------------------------------------------------- scenarios
-: >"$RESULTS_CSV"
-echo "label,iters,mean_ns,stddev_ns,min_ns,p50_ns,p90_ns,p99_ns,p999_ns,max_ns" \
-    >>"$RESULTS_CSV"
+# ------------------------------------------------------------------- header
+echo "scenario,n_prefixes,repeats,mean_p50_ns,stddev_p50_ns,min_p50_ns,max_p50_ns" \
+    >"$SWEEP_CSV"
 
-# 1) baseline -- no whitelister at all
-info "scenario 1/4: baseline (no BPF program attached)"
-run_bench baseline "$ALLOWED_FILE" >>"$RESULTS_CSV"
+info "iters=$ITERS warmup=$WARMUP repeats=$REPEATS sizes=[$NS]"
 
-# 2) BPF attached, comm does NOT match the bench process
-info "scenario 2/4: BPF attached, comm-miss"
-start_whitelister not_the_bench --allow "$DATA_DIR" \
-    --allow /lib --allow /lib64 \
-    --allow /usr --allow /etc \
-    --allow /proc --allow /dev
-run_bench bpf_comm_miss "$ALLOWED_FILE" >>"$RESULTS_CSV"
-stop_whitelister
+# --------------------------------------------------------------------- baseline
+# Baseline is independent of N (no BPF). We measure once with REPEATS samples
+# and replicate the row across every N so the plotter can render it as a
+# flat reference alongside the BPF scenarios.
+info "scenario 1/4: baseline (no BPF)"
+BASE_SAMPLES=()
+for ((r = 1; r <= REPEATS; r++)); do
+    BASE_SAMPLES+=("$(run_one "baseline_r$r" "$ALLOWED_FILE")")
+done
+BASE_STATS=$(printf '%s\n' "${BASE_SAMPLES[@]}" | aggregate)
+for n in $NS; do
+    echo "baseline,$n,$REPEATS,$BASE_STATS" >>"$SWEEP_CSV"
+done
+info "  baseline mean=$(echo "$BASE_STATS" | cut -d, -f1)ns ± $(echo "$BASE_STATS" | cut -d, -f2)ns"
 
-# 3) BPF attached, comm matches, file is on the allow list
-info "scenario 3/4: BPF attached, comm-hit, allow path"
-start_whitelister "$COMM_NAME" --allow "$DATA_DIR" \
-    --allow "$SCRIPT_DIR/build" \
-    --allow /lib --allow /lib64 \
-    --allow /usr --allow /etc \
-    --allow /proc --allow /dev
-run_bench bpf_comm_hit_allow "$ALLOWED_FILE" >>"$RESULTS_CSV"
-stop_whitelister
+# -------------------------------------------------------------------- comm-miss
+info "scenario 2/4: bpf_comm_miss (early-out, expected flat)"
+for n in $NS; do
+    decoy_args=()
+    if ((n > 1)); then
+        mapfile -t decoy_args < <(gen_decoys $((n - 1)))
+    fi
+    start_whitelister "not_the_bench" "${decoy_args[@]}" --allow "$DATA_DIR"
+    sweep_point bpf_comm_miss "$n" "$ALLOWED_FILE"
+    stop_whitelister
+done
 
-# 4) BPF attached, comm matches, file is NOT on the allow list -> EACCES
-info "scenario 4/4: BPF attached, comm-hit, deny path"
-start_whitelister "$COMM_NAME" --allow "$SCRIPT_DIR/build" \
-    --allow /lib --allow /lib64 \
-    --allow /usr --allow /etc \
-    --allow /proc --allow /dev
-stop_whitelister
+# ------------------------------------------------------------- comm-hit / allow
+# Place the matching prefix LAST so the scan visits all N entries before
+# matching -- worst case, gives the cleanest "cost vs N" curve.
+info "scenario 3/4: bpf_comm_hit_allow (worst-case scan: matching prefix last)"
+for n in $NS; do
+    decoy_args=()
+    if ((n > 1)); then
+        mapfile -t decoy_args < <(gen_decoys $((n - 1)))
+    fi
+    start_whitelister "$COMM_NAME" "${decoy_args[@]}" --allow "$DATA_DIR"
+    sweep_point bpf_comm_hit_allow "$n" "$ALLOWED_FILE"
+    stop_whitelister
+done
 
-# ----------------------------------------------------------------- comparison
-echo
-echo "=== results (ns per open()/close() pair) ==="
-awk -F, '
-NR == 1 {
-    printf "%-22s %8s %10s %10s %10s %10s %10s %10s\n",
-           "scenario","iters","mean","stddev","p50","p90","p99","max"
-    next
-}
-{
-    label=$1; iters=$2; mean=$3; sd=$4; p50=$6; p90=$7; p99=$8; max=$10
-    printf "%-22s %8d %10.0f %10.0f %10d %10d %10d %10d\n",
-           label, iters, mean, sd, p50, p90, p99, max
-}
-' "$RESULTS_CSV"
+# --------------------------------------------------------------- comm-hit / deny
+# Target file is NOT covered by any prefix -> full scan + EACCES.
+info "scenario 4/4: bpf_deny (full scan + EACCES)"
+for n in $NS; do
+    mapfile -t decoy_args < <(gen_decoys "$n")
+    start_whitelister "$COMM_NAME" "${decoy_args[@]}"
+    sweep_point bpf_deny "$n" "$DENIED_FILE" --expect-deny
+    stop_whitelister
+done
 
-echo
-echo "=== overhead vs. baseline (mean ns delta and ratio) ==="
-awk -F, '
-NR == 1 { next }
-NR == 2 { base=$3; printf "%-22s %12s %10s\n", "scenario","delta_ns","x_baseline"
-          printf "%-22s %12.0f %10s\n", $1, 0.0, "1.00x"; next }
-{
-    delta = $3 - base
-    ratio = $3 / base
-    printf "%-22s %12.0f %9.2fx\n", $1, delta, ratio
-}
-' "$RESULTS_CSV"
+info "sweep done -> $SWEEP_CSV"
 
-echo
-echo "raw CSV: $RESULTS_CSV"
-
-# ----------------------------------------------------------------------- plots
+# ----------------------------------------------------------------------- plot
 if [[ "${NO_PLOT:-0}" == "1" ]]; then
-    info "NO_PLOT=1 set; skipping plot generation"
+    info "NO_PLOT=1 set; skipping plots"
     exit 0
 fi
 
-PLOT_PY="$SCRIPT_DIR/plot.py"
-PLOTS_OUT="$SCRIPT_DIR/build/plots"
 PY="${PYTHON:-python}"
 
-# Resolve python binary: use $PYTHON if set, otherwise try python, then python3
-if [[ -n "${PYTHON:-}" ]]; then
-    PY="$PYTHON"
-elif command -v python >/dev/null 2>&1; then
-    PY="python"
-elif command -v python3 >/dev/null 2>&1; then
-    PY="python3"
-else
-    PY="python"
-fi
-
+# This project standardises on the 'python' command. We never fall back
+# to 'python3': if the active environment doesn't expose 'python', the
+# user is expected to either install it, point $PYTHON at their interpreter,
+# or set NO_PLOT=1 to skip plotting entirely.
 if ! command -v "$PY" >/dev/null 2>&1; then
     warn "'$PY' not found in PATH; skipping plots"
-    warn "(set PYTHON=/path/to/python or NO_PLOT=1 to silence)"
+    warn "this project requires 'python' (not 'python3') -- install it, or"
+    warn "set PYTHON=/path/to/python, or NO_PLOT=1 to silence"
     exit 0
 fi
 if ! "$PY" -c "import numpy, matplotlib" 2>/dev/null; then
-    warn "$PY is missing numpy/matplotlib; skipping plots"
-    warn "(install them in the active env or set PYTHON=... ; or NO_PLOT=1)"
+    warn "$PY missing numpy/matplotlib; skipping plots"
+    warn "(install via 'pip install -r $SCRIPT_DIR/requirements.txt' or NO_PLOT=1)"
     exit 0
 fi
 
-info "generating plots with $($PY --version 2>&1) ..."
+info "plotting with $($PY --version 2>&1) ..."
 
-# Drop privileges for matplotlib output so files in plots/ are owned by the
-# invoking user, not root. SUDO_USER is set by sudo when present.
+# Drop privileges so plot files in build/ are owned by the invoking user.
 if [[ -n "${SUDO_USER:-}" ]] && [[ "$(id -u)" -eq 0 ]]; then
     chown -R "$SUDO_USER":"$SUDO_USER" "$SCRIPT_DIR/build" 2>/dev/null || true
     sudo -u "$SUDO_USER" -- "$PY" "$PLOT_PY" --build-dir "$SCRIPT_DIR/build"

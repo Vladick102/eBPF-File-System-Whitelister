@@ -21,7 +21,12 @@
 // reasonable for the verifier.
 #define MAX_PATH 1024
 #define TASK_COMM_LEN 16
-#define MAX_PREFIXES 8
+// MAX_PREFIXES caps how many --allow entries the loader can push into the
+// config map. The hot loop in whitelist_file_open() is bounded by this at
+// compile time, so the verifier unrolls O(MAX_PREFIXES * MAX_PATH) state
+// transitions. 32 keeps that comfortably under the kernel's instruction
+// limit while leaving room for benchmarks that sweep up to ~25 entries.
+#define MAX_PREFIXES 32
 
 struct config {
     char target_comm[TASK_COMM_LEN];

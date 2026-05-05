@@ -30,12 +30,24 @@ cmd_deps() {
     need_root deps
     info "installing build dependencies (apt)..."
     apt-get update
+    # NOTE: we deliberately do NOT install the bare 'bpftool' package.
+    # On Ubuntu 24.04+, 'bpftool' is a virtual package with multiple
+    # providers (linux-tools-common, linux-lowlatency-tools-common, ...)
+    # so 'apt-get install bpftool' fails with "no installation candidate".
+    # linux-tools-$(uname -r) pulls in linux-tools-common, which provides
+    # the /usr/sbin/bpftool dispatcher we actually want.
     apt-get install -y \
         clang llvm \
         libbpf-dev libelf-dev zlib1g-dev \
-        bpftool linux-headers-"$(uname -r)" linux-tools-"$(uname -r)" ||
+        linux-tools-common \
+        linux-headers-"$(uname -r)" linux-tools-"$(uname -r)" ||
         apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev \
-            bpftool linux-headers-"$(uname -r)"
+            linux-tools-common linux-headers-"$(uname -r)"
+
+    if ! command -v bpftool >/dev/null 2>&1; then
+        die "bpftool not on PATH after install — try 'apt install linux-tools-$(uname -r)' manually"
+    fi
+    info "bpftool: $(command -v bpftool) ($(bpftool version 2>&1 | head -1))"
     info "dependencies installed"
 }
 
@@ -61,9 +73,32 @@ cmd_check() {
         return 0
     fi
 
+    local new_chain="${lsms},bpf"
     cat >&2 <<EOF
 
 [!] 'bpf' is NOT in the active LSM chain — the whitelister will fail to attach.
+
+    Active chain : $lsms
+    Required     : $new_chain   (append ',bpf')
+
+To fix (one-time, then reboot):
+
+  1. sudo \$EDITOR /etc/default/grub
+  2. Find the GRUB_CMDLINE_LINUX_DEFAULT="..." line and add (or extend)
+     an lsm= argument with the full ordered chain:
+
+       lsm=$new_chain
+
+     Example:
+       GRUB_CMDLINE_LINUX_DEFAULT="quiet splash lsm=$new_chain"
+
+  3. sudo update-grub
+  4. sudo reboot
+  5. Verify:  cat /sys/kernel/security/lsm   (should contain 'bpf')
+
+Note: the order matters. Keep the existing LSMs in the same order as
+shown above and just append ',bpf' at the end — re-ordering 'capability'
+or 'lockdown' can break the boot.
 
 EOF
     exit 1

@@ -23,8 +23,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <unistd.h>
+
+// Compiler-only fence: emits no instructions, but forces the compiler to
+// treat all memory as clobbered across this point. Without it, -O2 is free
+// to hoist or sink work across clock_gettime() (it has no side-effect
+// annotation visible to the optimiser via a normal libc call) and the
+// measured interval would no longer bracket the open() under test.
+#define COMPILER_BARRIER() __asm__ __volatile__("" ::: "memory")
 
 static int cmp_u64(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
@@ -39,14 +47,17 @@ static uint64_t ts_diff_ns(struct timespec *a, struct timespec *b) {
 static void usage(const char *p) {
     fprintf(stderr,
             "usage: %s --file <path> --iters <N> [--label NAME] "
-            "[--warmup N] [--expect-deny] [--dump <file>]\n"
+            "[--warmup N] [--expect-deny] [--dump <file>] [--set-comm <name>]\n"
             "\n"
             "  --file        path to open()/close() repeatedly\n"
             "  --iters       number of timed iterations (e.g. 100000)\n"
             "  --label       free-form name printed in the CSV record\n"
             "  --warmup      number of untimed warmup opens (default 1000)\n"
             "  --expect-deny treat EPERM/EACCES as success (deny-path bench)\n"
-            "  --dump        write raw uint64 ns samples (binary, little-endian)\n",
+            "  --dump        write raw uint64 ns samples (binary, little-endian)\n"
+            "  --set-comm    prctl(PR_SET_NAME) right before warmup, so the\n"
+            "                whitelister's --comm filter only matches the timed\n"
+            "                phase (not libc/ld loads at exec time)\n",
             p);
 }
 
@@ -54,6 +65,7 @@ int main(int argc, char **argv) {
     const char *path = NULL;
     const char *label = "bench";
     const char *dump_path = NULL;
+    const char *set_comm = NULL;
     long iters = 0;
     long warmup = 1000;
     int expect_deny = 0;
@@ -87,6 +99,10 @@ int main(int argc, char **argv) {
             dump_path = argv[++i];
             continue;
         }
+        if (!strcmp(argv[i], "--set-comm") && i + 1 < argc) {
+            set_comm = argv[++i];
+            continue;
+        }
         fprintf(stderr, "unknown argument: %s\n", argv[i]);
         usage(argv[0]);
         return 2;
@@ -101,6 +117,21 @@ int main(int argc, char **argv) {
     if (!samples) {
         perror("malloc");
         return 1;
+    }
+
+    // Switch comm AFTER all libc / ld.so initialisation but BEFORE the first
+    // open() the bench actually measures. The whitelister filters by comm,
+    // so this confines the LSM hook activity to just the warmup + timed
+    // loop. Without it, every libc.so / ld.so load done by exec() would
+    // hit the prefix scan too and we'd need to allow /lib /usr /etc /...
+    // just to keep the bench process alive -- which would eat the entire
+    // MAX_PREFIXES=8 budget and leave nothing to sweep over.
+    if (set_comm) {
+        if (prctl(PR_SET_NAME, set_comm, 0, 0, 0) < 0) {
+            perror("prctl(PR_SET_NAME)");
+            free(samples);
+            return 1;
+        }
     }
 
     // Warmup: pull pages, prime caches, settle CPU frequency.
@@ -131,9 +162,13 @@ int main(int argc, char **argv) {
 
     struct timespec t0, t1;
     for (long i = 0; i < iters; i++) {
+        COMPILER_BARRIER();
         clock_gettime(CLOCK_MONOTONIC, &t0);
+        COMPILER_BARRIER();
         int fd = open(path, O_RDONLY);
+        COMPILER_BARRIER();
         clock_gettime(CLOCK_MONOTONIC, &t1);
+        COMPILER_BARRIER();
 
         if (expect_deny) {
             if (fd >= 0) {
