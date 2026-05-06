@@ -1,11 +1,17 @@
 # eBPF File System Whitelister
 
-Whitelist file-system access for a named application using **eBPF** attached
-to the **`lsm/file_open`** Linux Security Module hook. The primary use case is
-to pin an application (such as `vsftpd`) to a specific set of directories: any
-`open(2)` it makes whose resolved path is not under one of the configured
-allow-prefixes is denied by the kernel with `EACCES`, regardless of how the
-application got there (symlinks, relative paths, in-process backdoors, etc.).
+Whitelist file-system access for one or more named applications using **eBPF**
+attached to the **`lsm/file_open`** Linux Security Module hook. The primary
+use case is to pin an application (e.g. `vsftpd`) to a specific set of
+directories: any `open(2)` it makes whose resolved path is not under one
+of the configured allow-prefixes is denied by the kernel with `EACCES`,
+regardless of how the application got there (symlinks, relative paths,
+in-process backdoors, etc.).
+
+A single whitelister instance can hold **independent allow-lists for
+multiple processes simultaneously** — e.g. one set of directories for
+`vsftpd` and a disjoint set for `sshd` — keyed on the kernel's
+`task_struct::comm` (15 chars + NUL).
 
 ## Layout
 
@@ -13,7 +19,8 @@ application got there (symlinks, relative paths, in-process backdoors, etc.).
 | ------------------ | ----------------------------------------------------------------------- |
 | [`advanced_hello/`](advanced_hello/) | A small CO-RE / `libbpf` "hello world" that traces `sys_enter_openat`. Useful as a reference for the toolchain and as a smoke test that BPF works on this kernel. |
 | [`whitelister/`](whitelister/)       | The actual enforcer: an LSM BPF program plus its user-space loader. |
-| [`whitelister/bench/`](whitelister/bench/) | A microbenchmark suite that measures the per-`open()` overhead of the whitelister against a no-BPF baseline. |
+| [`whitelister/tests/`](whitelister/tests/) | Integration test suite (multi-comm isolation, bypass, path-component boundary, CLI validation). |
+| [`whitelister/bench/`](whitelister/bench/) | A microbenchmark suite that measures the per-`open()` overhead vs. allow-list size and produces plots. |
 
 ## Prerequisites
 
@@ -24,7 +31,8 @@ application got there (symlinks, relative paths, in-process backdoors, etc.).
   and prints the exact edit for your system.
 - Root (`CAP_BPF` + `CAP_SYS_ADMIN`) at load time.
 - Toolchain: `clang`, `llvm`, `libbpf-dev`, `libelf-dev`, `zlib1g-dev`,
-  `bpftool`, `linux-headers-$(uname -r)`.
+  `linux-tools-common`, `linux-headers-$(uname -r)`,
+  `linux-tools-$(uname -r)`.
 
 `setup.sh deps` installs all of these via `apt`.
 
@@ -45,8 +53,10 @@ sudo ./setup.sh demo
 ```
 
 That leaves a runnable demo under `/tmp/ftp_whitelist_demo/` and a fake
-`ftp` reader binary at `/tmp/ftp`, with the exact commands to try printed
-to the terminal. A typical confinement:
+`ftp` reader at `/tmp/ftp`, with the exact commands to try printed to the
+terminal.
+
+### Confining a single process
 
 ```bash
 sudo ./build/whitelister --comm ftp \
@@ -56,6 +66,18 @@ sudo ./build/whitelister --comm ftp \
      --allow /etc --allow /proc --allow /dev
 ```
 
+### Confining multiple processes from one loader
+
+```bash
+sudo ./build/whitelister \
+     --comm vsftpd  --allow /srv/ftp --allow /lib --allow /usr \
+     --comm sshd    --allow /etc/ssh --allow /var/log/auth.log
+```
+
+Each comm sees only its own allow-list; `vsftpd` cannot reach `/etc/ssh`
+and `sshd` cannot reach `/srv/ftp`. Processes whose comm is **not**
+listed are unaffected by the whitelister.
+
 Denials are logged via `bpf_printk`:
 
 ```bash
@@ -63,29 +85,74 @@ sudo cat /sys/kernel/debug/tracing/trace_pipe
 ```
 
 See [whitelister/README.md](whitelister/README.md) for the full enforcer
-documentation.
+documentation and limits (compile-time: 16 distinct comms, 128 prefixes
+total, 1024-byte path).
+
+## Architecture & lookup model
+
+The BPF program holds two flat hash maps:
+
+| Map                | Type        | Key                                       | Purpose                                      |
+| ------------------ | ----------- | ----------------------------------------- | -------------------------------------------- |
+| `configured_comms` | `HASH`      | `char[16]`                                | Set: which comms have any policy at all.     |
+| `allow_prefixes`   | `HASH`      | `(char comm[16], char path[1024])`        | Allowed `(process, prefix)` pairs.           |
+
+On every `open()` the LSM hook does:
+
+1. Read `task->comm` via `bpf_get_current_comm()`.
+2. Look up `configured_comms[comm]` (`O(1)`). If absent → return 0
+   (the open proceeds; this comm has no policy).
+3. Resolve the absolute path with `bpf_d_path()`.
+4. Walk the resolved path's component chain in descending length order
+   (`/srv/ftp/file.txt` → `/srv/ftp` → `/srv` → `/`) and probe each
+   step in `allow_prefixes`. First hit → allow. No hit by `/` → deny
+   (`-EPERM` ⇒ `EACCES` to userspace).
+
+Cost is `O(D)` where `D` is the path's depth (typically 5–10), and
+**independent of how many `--allow` entries** the loader pushed in. This
+replaces an earlier linear-scan implementation whose cost grew with `N`;
+the bench shows the difference directly via the `slope: X ns/entry`
+annotation in its plot legends.
+
+## Tests
+
+Integration tests live in [`whitelister/tests/`](whitelister/tests/) and
+cover the policy contract: multi-comm isolation, unconfigured-comm
+bypass, path-component boundary semantics, single-comm backward compat,
+comm truncation to 15 chars, and CLI validation (`--allow` before
+`--comm`, exceeding `MAX_COMMS`).
+
+```bash
+cd whitelister
+sudo ./tests/run_tests.sh -v
+```
+
+Returns 0 if every case passes, non-zero on any failure.
 
 ## Benchmarks
 
-The benchmark suite quantifies the cost of the LSM hook on `open()` latency.
-It exercises three things that matter independently:
+The bench quantifies per-`open()` cost against allow-list size and
+saves two plots.
 
-1. **Baseline** — no BPF program attached. This is the raw VFS+filesystem
-   `open()` cost on the host.
-2. **BPF attached, `comm` miss** — the program is loaded but the bench
-   process's `task->comm` does not match `--comm`, so the program returns
-   from the early-out branch (LSM dispatch + `bpf_get_current_comm` + comm
-   compare).
-3. **BPF attached, `comm` hit, allow path** — the path is allowed, so the
-   program walks the full hot path: `bpf_d_path()` to materialise the
-   absolute path, then a linear prefix scan over the allow list.
-4. **BPF attached, `comm` hit, deny path** — the path is *not* allowed, so
-   the program returns `-EPERM` and the kernel surfaces `EACCES` to the
-   caller.
+### Scenarios
 
-The benchmark binary opens its target file from a process whose `comm`
-is set (via a symlinked filename) to `wlbench_target`, so it fits within
-the 15-byte `task->comm` limit and matches reliably across runs.
+1. **baseline** — no whitelister attached. Pure VFS `open()` cost.
+2. **comm-miss** — whitelister loaded with `--comm <some_other_name>`
+   so the bench process is unconfigured. The hook reads `comm`, finds
+   it not in `configured_comms`, and bypasses immediately. This
+   measures the cost the LSM hook imposes on every *unrelated*
+   process on the system.
+3. **comm-hit, allow** — whitelister configured with the bench's own
+   comm, allow-list of size N includes the target file. Hash-walk
+   ends in a hit.
+4. **comm-hit, deny** — same comm match, but the target file is
+   under no `--allow` prefix. Hash-walk reaches `/` without a hit;
+   the kernel returns `EACCES`.
+
+The bench process flips its own comm via `prctl(PR_SET_NAME)` *after*
+all libc / ld.so loads, so the LSM hook only matches the warmup +
+timed phase. That keeps the allow-list available exclusively for
+the actual sweep instead of being eaten by `/lib`, `/usr`, etc.
 
 ### Building and running
 
@@ -96,125 +163,63 @@ sudo ./setup.sh deps     # if you have not already
      ./setup.sh check
      ./setup.sh build
 
-# 2. build and run the bench (this script needs sudo for the loader)
-cd bench
-sudo ./run_bench.sh
+# 2. build and run the bench (script needs sudo for the loader)
+sudo ./bench/run_bench.sh
 ```
 
-Knobs (environment variables):
+### Knobs
 
-| Variable | Default | Meaning                                |
-| -------- | ------- | -------------------------------------- |
-| `ITERS`  | `50000` | Number of timed `open()`/`close()` pairs per scenario. |
-| `WARMUP` | `2000`  | Untimed warmup opens before each scenario, to prime caches and CPU frequency. |
-
-Example:
+| Variable | Default       | Meaning                                         |
+| -------- | ------------- | ----------------------------------------------- |
+| `ITERS`  | `10000`       | Timed `open()/close()` pairs per single run.    |
+| `WARMUP` | `1000`        | Untimed warmup opens, primes caches and DVFS.   |
+| `REPEATS`| `30`          | Independent runs per `(scenario, N)` cell. Per-run p50 is taken first, then aggregated mean ± stddev across repeats. |
+| `NS`     | `1 5 10…100`  | Allow-list sizes to sweep.                      |
+| `NO_PLOT`| unset         | If `1`, skip plotting; raw CSV is written either way. |
+| `PYTHON` | `python`      | Interpreter for `plot.py` (must have `numpy` + `matplotlib`). |
 
 ```bash
-sudo ITERS=200000 WARMUP=5000 ./run_bench.sh
+sudo REPEATS=50 NS="1 10 20 30" ./bench/run_bench.sh
 ```
 
 ### Output
 
-The script prints two tables: one with the per-scenario distribution
-(mean, stddev, p50/p90/p99/max in nanoseconds), and a second showing the
-mean overhead of each scenario relative to the baseline, both as an
-absolute delta (`Δ ns`) and as a multiplicative factor (`× baseline`).
+| File                                     | Contents                                                         |
+| ---------------------------------------- | ---------------------------------------------------------------- |
+| `bench/build/sweep.csv`                  | One row per `(scenario, N)`: `mean_p50_ns`, `stddev_p50_ns`, `min`, `max`. |
+| `bench/build/whitelister.log`            | Loader stdout/stderr from the most recent BPF attach.            |
+| `bench/build/plots/latency_vs_allowlist.png` | Median latency per scenario as a function of N, with ±1σ band and per-line slope annotation in the legend. |
+| `bench/build/plots/overhead_vs_allowlist.png` | `(scenario_p50 − baseline_p50)` vs. N. Same band/slope treatment. |
 
-Per-run artefacts under `whitelister/bench/build/`:
+#### Reading the plots
 
-| File                          | Contents                                              |
-| ----------------------------- | ----------------------------------------------------- |
-| `results.csv`                 | Summary stats: `label,iters,mean,stddev,min,p50,p90,p99,p999,max` (ns). |
-| `raw_<scenario>.bin`          | Raw per-iteration latency samples (`uint64` ns, little-endian, insertion order). |
-| `whitelister.log`             | stdout/stderr of the loader for the most recent scenario. |
-| `plots/*.png`                 | Plots produced from the CSV + raw data (see below).   |
+Each line in the legend is annotated with its linear-fit slope:
+`[+0.0 ns/entry]` means cost is constant in N (the new hashmap-walk
+regime), `[+50 ns/entry]` would indicate a linear-scan policy where
+each added prefix costs another comparison. The intent of the bench
+is to read this number directly: under the current architecture,
+`comm-hit, allow` and `comm-hit, deny` should both pin near zero.
 
-### Plots
-
-After all scenarios finish, the runner generates a set of PNG plots under
-`whitelister/bench/build/plots/`:
-
-| File                              | What it shows                                                            |
-| --------------------------------- | ------------------------------------------------------------------------ |
-| `latency_summary.png`             | Mean per scenario as bars (whiskers = 1 stddev), with p50/p90/p99 markers overlaid. |
-| `overhead_vs_baseline.png`        | Two panels: added latency over baseline (Δ ns) and the ratio (× baseline). |
-| `latency_cdf.png`                 | CDF of per-`open()` latency across all scenarios on the same axes, with a tail-zoom inset (p90 → p100, log-scaled). |
-| `latency_distribution.png`        | Violin plot of each scenario's distribution (clipped at 1.5 × p99) with median, mean, and p99 markers. |
-| `jitter_timeline.png`             | Latency per iteration over the run, one panel per scenario (downsampled if huge). |
-
-The plotter (`bench/plot.py`) needs `numpy` and `matplotlib`. The runner
-calls whatever `python` resolves to (override with `PYTHON=...`) and
-expects the modules to already be importable; if not, the plot step is
-skipped with a warning and the raw data is left in `build/` for you to
-plot yourself.
-
-Set `NO_PLOT=1` to skip plotting entirely. Pick a different interpreter
-with `PYTHON`:
+Re-render plots without re-collecting data:
 
 ```bash
-sudo NO_PLOT=1 ./run_bench.sh
-sudo PYTHON=/path/to/python ./run_bench.sh
+python whitelister/bench/plot.py --build-dir whitelister/bench/build
 ```
 
-Note: `sudo` resets `PATH` by default, so a `venv`-activated shell will
-not propagate; pass the venv interpreter explicitly with `PYTHON=` (or
-use `sudo -E`).
-
-You can also re-plot from the raw data without re-running the bench:
+`sudo` resets `PATH` by default, so a venv-activated shell will not
+propagate; pass the venv interpreter explicitly with `PYTHON=` (or use
+`sudo -E`):
 
 ```bash
-python plot.py --build-dir build
-```
-
-### Path-length sweep
-
-`run_bench.sh` measures the four scenarios at one fixed path. To see how
-the BPF overhead scales with the *length* of the path that the kernel
-hands to the LSM hook, use the sweep script:
-
-```bash
-sudo ./sweep.sh -v          # writes build/sweep.csv and build/plots/sweep_path_length.png
-```
-
-It runs each scenario across a range of target-path lengths
-(`LENGTHS=64 128 192 ... 960` by default, override with the env var)
-and produces a single multi-line chart: x = path length in bytes,
-y = **median** `open()` latency, one line per scenario.
-
-Why median, not mean: at this scale a single tail spike (scheduler
-preemption, page-cache miss) can shift `mean ± stddev` bands by tens of
-microseconds and swamp the actual signal. The median is robust to those
-outliers and shows the trend a target process actually feels per call.
-
-Expected shape: `baseline` and `bpf_comm_miss` stay nearly flat (no
-path resolution, no prefix scan), while `bpf_comm_hit_allow` and
-`bpf_deny` rise roughly linearly because `bpf_d_path()` walks the
-dentry chain proportional to path length, and the prefix-compare loop
-does the same.
-
-> **Heads-up:** the sweep needs the larger `MAX_PATH=1024` BPF buffer
-> introduced in `whitelister.bpf.c`. If you upgraded from an earlier
-> version (`MAX_PATH=256`), rebuild the loader before running:
->
-> ```bash
-> sudo make -C whitelister clean && sudo make -C whitelister
-> ```
-
-To re-plot just the sweep without re-collecting data:
-
-```bash
-python plot.py --sweep --build-dir build
+sudo PYTHON=~/.venv/bin/python ./bench/run_bench.sh
 ```
 
 ### What the benchmark does *not* cover
 
-- It measures **microbenchmark** open-call latency on a single warm file.
-  Production workloads pay this cost only on real `open()` syscalls; the
-  hook does **not** intercept `read`/`write` on already-open file
-  descriptors.
-- It does not test multi-threaded contention. Real LSM enforcement runs
-  in the calling task's context, so per-`open()` cost is what scales.
-- The `comm`-miss path is reported as a separate scenario because it is
-  what every *non-target* process on the system pays once the program
-  is loaded.
+- Microbenchmark per-`open()` latency only. Production workloads pay
+  this on real `open()` syscalls; the hook does **not** intercept
+  `read`/`write` on already-open file descriptors.
+- It does not test multi-threaded contention. LSM hooks run in the
+  caller's task context, so per-`open()` cost is what scales.
+- The `comm`-miss scenario reflects the cost every *non-target*
+  process on the system pays once a whitelister is loaded.

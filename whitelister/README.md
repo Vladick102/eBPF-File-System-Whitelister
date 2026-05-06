@@ -12,9 +12,11 @@ path manipulation by the application itself.
 ## Files
 
 - `whitelister.bpf.c` — the LSM BPF program (runs in the kernel).
-- `whitelister.c` — libbpf loader; pushes config into a BPF map and attaches.
+- `whitelister.c` — libbpf loader; pushes config into BPF maps and attaches.
 - `Makefile` — builds both.
 - `setup.sh` — one script for install / check / build / demo.
+- `tests/` — integration test suite (sudo `./tests/run_tests.sh`).
+- `bench/` — open()/close() microbenchmark and plotting.
 
 ## Prerequisites
 
@@ -42,16 +44,34 @@ sudo ./setup.sh demo    # lay down demo files
 
 ## Usage
 
-The binary is built out-of-source into `build/whitelister`:
+The binary is built out-of-source into `build/whitelister`. One invocation
+can hold policies for multiple processes simultaneously — flags are read
+left-to-right and each `--allow` attaches to the most-recent `--comm`:
 
 ```
-sudo ./build/whitelister --comm <process_name> --allow <path> [--allow <path> ...]
+sudo ./build/whitelister \
+     --comm <name_A> --allow <path> [--allow <path> ...] \
+     [--comm <name_B> --allow <path> ...]
 ```
 
-- `--comm` matches Linux's 16-byte `task->comm` (same as `ps -o comm`).
-- `--allow` is a path prefix; pass one per directory. Up to 8.
+- `--comm` matches Linux's `task->comm` field. **Why 15 chars + NUL:**
+  `task_struct::comm` in the kernel is `char[16]` (`TASK_COMM_LEN = 16`,
+  see `include/linux/sched.h`). `execve()` sources it from the binary's
+  basename and `prctl(PR_SET_NAME, ...)` updates it at runtime; both
+  silently truncate longer strings to 15 chars + NUL. The loader applies
+  the same truncation to `--comm` values so the BPF-side comm key matches
+  the kernel's truncated runtime value bit-for-bit.
+- `--allow` is a path prefix; repeatable. Each prefix matches on path-
+  component boundaries: `--allow /tmp/foo` allows `/tmp/foo` and
+  `/tmp/foo/x` but **not** `/tmp/foobar`.
+- A process whose comm is **not** in any `--comm` group bypasses the
+  whitelister entirely. Only configured comms are enforced.
 
-Real FTP example (vsftpd chroot'd to `/srv/ftp`):
+Limits (compile-time, in `whitelister.bpf.c`): 16 distinct `--comm`
+values, 128 `--allow` entries total across all comms, 1024-byte path
+prefix length.
+
+### Single-binary example (vsftpd chroot'd to `/srv/ftp`):
 
 ```bash
 sudo ./build/whitelister --comm vsftpd \
@@ -59,6 +79,33 @@ sudo ./build/whitelister --comm vsftpd \
      --allow /lib --allow /lib64 --allow /usr \
      --allow /etc --allow /proc --allow /dev
 ```
+
+### Multi-binary example (independent policies):
+
+```bash
+sudo ./build/whitelister \
+     --comm vsftpd  --allow /srv/ftp --allow /lib --allow /usr \
+     --comm sshd    --allow /etc/ssh --allow /var/log/auth.log
+```
+
+Each comm only sees its own allow-list; vsftpd cannot reach
+`/etc/ssh` and sshd cannot reach `/srv/ftp` even though both policies
+are loaded by the same whitelister instance. Anything else
+(comm not listed) is unaffected.
+
+## Lookup model
+
+The BPF program holds two flat hash maps:
+
+- `configured_comms` — set of comms with a policy. Lookup `O(1)`; if the
+  current comm is absent, the hook returns immediately and the open
+  proceeds unchanged.
+- `allow_prefixes` — `(comm, path)` → marker. For an open, the program
+  walks the resolved path's component chain in descending length order
+  (`/srv/ftp/file.txt` → `/srv/ftp` → `/srv` → `/`) and probes each
+  step in this map. First hit allows; no hit by the time the walk
+  reaches `/` denies. Cost is `O(D)` where `D` is path depth (~5–10 in
+  practice), independent of how many entries are configured.
 
 Denials are logged via `bpf_printk`:
 

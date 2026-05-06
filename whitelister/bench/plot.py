@@ -143,6 +143,22 @@ def repeats_caption(repeats: set[int]) -> str:
             "runs/point")
 
 
+def slope_label(xs, ys) -> str:
+    """Linear-fit slope of (xs, ys) as a 'X.Y ns/entry' string.
+
+    Used in legend labels to make the architectural property visible:
+    a hashmap-with-walk lookup yields a slope near zero (cost is
+    independent of allow-list size), while a linear-scan lookup yields
+    a slope ~equal to the per-prefix compare cost. Reading the number
+    off the legend tells the reader which regime the run is in.
+    """
+    if len(xs) < 2 or np.ptp(xs) == 0:
+        return ""
+    slope = np.polyfit(xs, ys, 1)[0]
+    sign = "+" if slope >= 0 else "-"
+    return f"{sign}{abs(slope):.1f} ns/entry"
+
+
 def ordered(scenarios) -> list[str]:
     out = [s for s in SCENARIO_ORDER if s in scenarios]
     for s in scenarios:
@@ -172,8 +188,13 @@ def plot_latency(by: dict, out: Path, repeats: set[int]) -> None:
         # keeps the central line readable when bands overlap.
         ax.fill_between(xs, ys - sds, ys + sds, color=c,
                         alpha=0.15, linewidth=0, zorder=2)
+        # Annotate the legend with the linear-fit slope so a reader can
+        # tell at a glance whether the scenario's cost grows with N
+        # (linear-scan policy) or stays flat (hashmap-with-walk policy).
+        slope = slope_label(xs, ys)
+        label = pretty(scenario) + (f"  [{slope}]" if slope else "")
         ax.plot(xs, ys, marker="o", linewidth=2.0, markersize=5.5,
-                color=c, label=pretty(scenario), zorder=3)
+                color=c, label=label, zorder=3)
 
     ax.set_xlabel("Allow-list size (number of prefixes)")
     ax.set_ylabel("Median open()/close() latency")
@@ -227,8 +248,10 @@ def plot_overhead(by: dict, out: Path, repeats: set[int]) -> None:
 
         ax.fill_between(xs, ys - sds, ys + sds, color=c,
                         alpha=0.15, linewidth=0, zorder=2)
+        slope = slope_label(xs, ys)
+        label = pretty(scenario) + (f"  [{slope}]" if slope else "")
         ax.plot(xs, ys, marker="o", linewidth=2.0, markersize=5.5,
-                color=c, label=pretty(scenario), zorder=3)
+                color=c, label=label, zorder=3)
 
     ax.axhline(0, color="#888", linewidth=1, zorder=1)
 
