@@ -23,7 +23,7 @@
 #define MAX_PATH 1024
 #define TASK_COMM_LEN 16
 // Must match MAX_PREFIXES in whitelister.bpf.c.
-#define MAX_PREFIXES 32
+#define MAX_PREFIXES 100
 
 struct config {
     char target_comm[TASK_COMM_LEN];

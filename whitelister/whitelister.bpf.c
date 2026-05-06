@@ -22,11 +22,11 @@
 #define MAX_PATH 1024
 #define TASK_COMM_LEN 16
 // MAX_PREFIXES caps how many --allow entries the loader can push into the
-// config map. The hot loop in whitelist_file_open() is bounded by this at
-// compile time, so the verifier unrolls O(MAX_PREFIXES * MAX_PATH) state
-// transitions. 32 keeps that comfortably under the kernel's instruction
-// limit while leaving room for benchmarks that sweep up to ~25 entries.
-#define MAX_PREFIXES 32
+// config map. The outer prefix scan is implemented via bpf_loop() so the
+// verifier complexity is O(MAX_PATH), not O(MAX_PREFIXES * MAX_PATH) --
+// raising this constant therefore costs map memory but not verifier
+// budget. The config map grows linearly with it (~100 KB at this size).
+#define MAX_PREFIXES 100
 
 struct config {
     char target_comm[TASK_COMM_LEN];
@@ -88,6 +88,42 @@ static __always_inline int has_prefix(const char *path, const char *prefix,
     return 0;
 }
 
+// bpf_loop() callback context. The verifier enters the callback as a
+// fresh subprog with no state from the caller, so we have to re-check
+// cfg != NULL inside even though the LSM hook has already proven it
+// non-NULL on the outer path.
+struct prefix_check_ctx {
+    const char *path;
+    struct config *cfg;
+    int matched;
+};
+
+static long prefix_check_one(__u32 i, struct prefix_check_ctx *ctx) {
+    // Derive the array index via an explicit mask so the verifier sees a
+    // hard upper bound that survives compiler optimisation. Just adding
+    // `if (i >= MAX_PREFIXES) return 1;` isn't enough: clang often keeps
+    // the original (unbounded) copy of `i` alive in another register and
+    // re-truncates it for the indexed load, defeating the runtime check.
+    // The AND below produces a fresh scalar whose [0, 127] bound is
+    // attached to a value that is *mathematically* distinct from `i`
+    // unless i < 128 -- which it always is at runtime, since bpf_loop()
+    // only invokes the callback with i in [0, MAX_PREFIXES-1].
+    __u32 idx = i & 0x7f;
+    if (idx >= MAX_PREFIXES)
+        return 1;
+
+    struct config *cfg = ctx->cfg;
+    if (!cfg)                       // verifier proof; runtime no-op
+        return 1;
+    if (idx >= cfg->num_prefixes)
+        return 1;                   // past the live entries -> stop
+    if (has_prefix(ctx->path, cfg->prefixes[idx], cfg->prefix_lens[idx])) {
+        ctx->matched = 1;
+        return 1;                   // hit -> stop early
+    }
+    return 0;                       // miss -> keep scanning
+}
+
 SEC("lsm/file_open")
 int BPF_PROG(whitelist_file_open, struct file *file) {
     __u32 key = 0;
@@ -110,12 +146,20 @@ int BPF_PROG(whitelist_file_open, struct file *file) {
     if (plen < 0)
         return 0;
 
-    for (__u32 i = 0; i < MAX_PREFIXES; i++) {
-        if (i >= cfg->num_prefixes)
-            break;
-        if (has_prefix(scratch->buf, cfg->prefixes[i], cfg->prefix_lens[i]))
-            return 0;
-    }
+    // Runtime-bounded scan via bpf_loop(): the verifier sees the loop body
+    // once (as a subprog) instead of unrolling MAX_PREFIXES copies, which
+    // is what kept the program under the 1M-insn verifier limit when
+    // MAX_PREFIXES grew past ~32.
+    // Note: 'ctx' is taken by BPF_PROG's hidden first arg, so we name
+    // ours 'pctx' (prefix-check context).
+    struct prefix_check_ctx pctx = {
+        .path    = scratch->buf,
+        .cfg     = cfg,
+        .matched = 0,
+    };
+    bpf_loop(MAX_PREFIXES, prefix_check_one, &pctx, 0);
+    if (pctx.matched)
+        return 0;
 
     bpf_printk("whitelister: BLOCK pid=%d comm=%s path=%s",
                bpf_get_current_pid_tgid() >> 32, comm, scratch->buf);

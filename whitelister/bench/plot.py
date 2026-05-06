@@ -96,23 +96,24 @@ def setup_style() -> None:
 
 
 def fmt_ns(ax, axis: str = "x") -> None:
-    """Format a ns axis as either ns or us depending on magnitude."""
+    """Format a ns-valued axis in microseconds."""
     def _fmt(v, _pos):
-        if v >= 1000:
-            return f"{v/1000:.1f} us"
-        return f"{int(v)} ns"
+        return f"{v/1000:.2f} us"
     target = ax.xaxis if axis == "x" else ax.yaxis
     target.set_major_formatter(mticker.FuncFormatter(_fmt))
 
 
-def load(build_dir: Path) -> dict[str, list[tuple[int, float, float, float, float]]]:
-    """Read sweep.csv. Returns scenario -> sorted list of
-    (n_prefixes, mean_p50, stddev_p50, min_p50, max_p50)."""
+def load(build_dir: Path):
+    """Read sweep.csv. Returns (scenarios_by_label, repeats_set) where
+    scenarios_by_label maps scenario -> sorted list of
+    (n_prefixes, mean_p50, stddev_p50, min_p50, max_p50), and
+    repeats_set is the set of REPEATS values seen across all rows."""
     csv_path = build_dir / "sweep.csv"
     if not csv_path.is_file():
         sys.exit(f"error: {csv_path} not found -- run run_bench.sh first")
 
     by: dict[str, list[tuple[int, float, float, float, float]]] = defaultdict(list)
+    repeats: set[int] = set()
     with csv_path.open() as f:
         for row in csv.DictReader(f):
             by[row["scenario"]].append((
@@ -122,11 +123,24 @@ def load(build_dir: Path) -> dict[str, list[tuple[int, float, float, float, floa
                 float(row["min_p50_ns"]),
                 float(row["max_p50_ns"]),
             ))
+            repeats.add(int(row["repeats"]))
     if not by:
         sys.exit(f"error: {csv_path} contains no rows")
     for k in by:
         by[k].sort(key=lambda r: r[0])
-    return dict(by)
+    return dict(by), repeats
+
+
+def repeats_caption(repeats: set[int]) -> str:
+    """Short descriptor for the figure title, e.g. 'mean +/- 1sigma over
+    30 runs/point'. Falls back to a range if the CSV mixes values."""
+    if not repeats:
+        return ""
+    if len(repeats) == 1:
+        n = next(iter(repeats))
+        return f"mean $\\pm$ 1$\\sigma$ over {n} runs/point"
+    return (f"mean $\\pm$ 1$\\sigma$ over {min(repeats)}-{max(repeats)} "
+            "runs/point")
 
 
 def ordered(scenarios) -> list[str]:
@@ -137,7 +151,7 @@ def ordered(scenarios) -> list[str]:
     return out
 
 
-def plot_latency(by: dict, out: Path) -> None:
+def plot_latency(by: dict, out: Path, repeats: set[int]) -> None:
     """Latency vs allow-list size, one line per scenario, +/-stddev band.
 
     Same line-plot aesthetic as the project's other multi-scenario plots:
@@ -163,7 +177,11 @@ def plot_latency(by: dict, out: Path) -> None:
 
     ax.set_xlabel("Allow-list size (number of prefixes)")
     ax.set_ylabel("Median open()/close() latency")
-    ax.set_title("eBPF whitelister - latency vs. allow-list size")
+    title = "eBPF whitelister - latency vs. allow-list size"
+    cap = repeats_caption(repeats)
+    if cap:
+        title += f"\n({cap})"
+    ax.set_title(title)
     fmt_ns(ax, "y")
 
     # y starts at 0 so absolute BPF overhead is visible at a glance.
@@ -180,7 +198,7 @@ def plot_latency(by: dict, out: Path) -> None:
     print(f"[plot] wrote {out}")
 
 
-def plot_overhead(by: dict, out: Path) -> None:
+def plot_overhead(by: dict, out: Path, repeats: set[int]) -> None:
     """(scenario_p50 - baseline_p50) vs allow-list size.
 
     Error band combines per-scenario and baseline variance:
@@ -216,8 +234,12 @@ def plot_overhead(by: dict, out: Path) -> None:
 
     base_p50 = next(iter(base.values()))[0]
     ax.set_xlabel("Allow-list size (number of prefixes)")
-    ax.set_ylabel(f"Latency added over baseline ({base_p50:.0f} ns)")
-    ax.set_title("eBPF whitelister - overhead vs. allow-list size")
+    ax.set_ylabel(f"Latency added over baseline ({base_p50/1000:.2f} us)")
+    title = "eBPF whitelister - overhead vs. allow-list size"
+    cap = repeats_caption(repeats)
+    if cap:
+        title += f"\n({cap})"
+    ax.set_title(title)
     fmt_ns(ax, "y")
     ax.legend(loc="upper left", title=None)
 
@@ -246,11 +268,11 @@ def main() -> int:
 
     setup_style()
 
-    by = load(args.build_dir)
+    by, repeats = load(args.build_dir)
     print(f"[plot] loaded {len(by)} scenario(s) from {args.build_dir}")
 
-    plot_latency(by,  out_dir / "latency_vs_allowlist.png")
-    plot_overhead(by, out_dir / "overhead_vs_allowlist.png")
+    plot_latency(by,  out_dir / "latency_vs_allowlist.png", repeats)
+    plot_overhead(by, out_dir / "overhead_vs_allowlist.png", repeats)
 
     print(f"[plot] done -> {out_dir}")
     return 0

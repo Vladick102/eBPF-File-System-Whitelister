@@ -3,8 +3,8 @@
 # number of allow-list entries.
 #
 # For each scenario in (baseline, bpf_comm_miss, bpf_comm_hit_allow, bpf_deny)
-# and each allow-list size N in NS (default {1, 4, 7, ..., 25}), we run the
-# open() microbenchmark
+# and each allow-list size N in NS (default {1, 5, 10, ..., 95, 100}),
+# we run the open() microbenchmark
 # REPEATS times, take the per-run p50, and aggregate (mean, stddev) across
 # the repeats. The repeats average out cross-run system noise (scheduler
 # preemption, cache state, IRQ jitter) so the curves are representative
@@ -91,10 +91,10 @@ PLOTS_OUT="$SCRIPT_DIR/build/plots"
 ITERS="${ITERS:-10000}"
 WARMUP="${WARMUP:-1000}"
 REPEATS="${REPEATS:-30}"
-# Sweep up to 25 entries. MAX_PREFIXES in whitelister.bpf.c is 32, so this
-# leaves a small safety margin without needing to rebuild the BPF program.
-# Step of 3 -> 9 evenly-spaced points; tweak via NS=... to taste.
-NS="${NS:-1 4 7 10 13 16 19 22 25}"
+# Sweep up to 100 entries (capped by MAX_PREFIXES in whitelister.bpf.c).
+# 21 points: {1} ∪ {5,10,15,...,100}. Override via NS="..." for a different
+# point density.
+NS="${NS:-1 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95 100}"
 
 info() { echo "[*] $*"; }
 vinfo() { ((VERBOSE)) && echo "[v] $*" >&2 || true; }
