@@ -30,24 +30,34 @@ cmd_deps() {
     need_root deps
     info "installing build dependencies (apt)..."
     apt-get update
-    # NOTE: we deliberately do NOT install the bare 'bpftool' package.
-    # On Ubuntu 24.04+, 'bpftool' is a virtual package with multiple
-    # providers (linux-tools-common, linux-lowlatency-tools-common, ...)
-    # so 'apt-get install bpftool' fails with "no installation candidate".
-    # linux-tools-$(uname -r) pulls in linux-tools-common, which provides
-    # the /usr/sbin/bpftool dispatcher we actually want.
-    apt-get install -y \
-        clang llvm \
-        libbpf-dev libelf-dev zlib1g-dev \
-        linux-tools-common \
-        linux-headers-"$(uname -r)" linux-tools-"$(uname -r)" ||
-        apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev \
-            linux-tools-common linux-headers-"$(uname -r)"
 
-    if ! command -v bpftool >/dev/null 2>&1; then
-        die "bpftool not on PATH after install — try 'apt install linux-tools-$(uname -r)' manually"
+    local base_pkgs=(
+        clang llvm
+        libbpf-dev libelf-dev zlib1g-dev
+        linux-headers-"$(uname -r)"
+    )
+    local bpftool_pkgs=()
+
+    if apt-cache show bpftool >/dev/null 2>&1; then
+        bpftool_pkgs+=(bpftool)
+    elif apt-cache show linux-tools-"$(uname -r)" >/dev/null 2>&1; then
+        bpftool_pkgs+=(linux-tools-common linux-tools-"$(uname -r)")
+    elif apt-cache show linux-tools-common >/dev/null 2>&1; then
+        bpftool_pkgs+=(linux-tools-common)
     fi
-    info "bpftool: $(command -v bpftool) ($(bpftool version 2>&1 | head -1))"
+
+    apt-get install -y "${base_pkgs[@]}" "${bpftool_pkgs[@]}"
+
+    local bpftool_bin
+    bpftool_bin="$(command -v bpftool || true)"
+    if [[ -z "$bpftool_bin" && -x /usr/sbin/bpftool ]]; then
+        bpftool_bin=/usr/sbin/bpftool
+    fi
+
+    if [[ -z "$bpftool_bin" ]]; then
+        die "bpftool not on PATH after install — try 'apt install bpftool' or your distro's linux-tools package manually"
+    fi
+    info "bpftool: $bpftool_bin ($("$bpftool_bin" version 2>&1 | head -1))"
     info "dependencies installed"
 }
 

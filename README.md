@@ -4,7 +4,7 @@ Whitelist file-system access for one or more named applications using **eBPF**
 attached to the **`lsm/file_open`** Linux Security Module hook. The primary
 use case is to pin an application (e.g. `vsftpd`) to a specific set of
 directories: any `open(2)` it makes whose resolved path is not under one
-of the configured allow-prefixes is denied by the kernel with `EACCES`,
+of the configured allow-prefixes is denied by the kernel with `EPERM`,
 regardless of how the application got there (symlinks, relative paths,
 in-process backdoors, etc.).
 
@@ -19,22 +19,25 @@ multiple processes simultaneously** — e.g. one set of directories for
 | ------------------ | ----------------------------------------------------------------------- |
 | [`advanced_hello/`](advanced_hello/) | A small CO-RE / `libbpf` "hello world" that traces `sys_enter_openat`. Useful as a reference for the toolchain and as a smoke test that BPF works on this kernel. |
 | [`whitelister/`](whitelister/)       | The actual enforcer: an LSM BPF program plus its user-space loader. |
+| [`whitelister/gui.py`](whitelister/gui.py) | Optional PyQt6 GUI for building and live-updating multi-process policies. |
 | [`whitelister/tests/`](whitelister/tests/) | Integration test suite (multi-comm isolation, bypass, path-component boundary, CLI validation). |
 | [`whitelister/bench/`](whitelister/bench/) | A microbenchmark suite that measures the per-`open()` overhead vs. allow-list size and produces plots. |
 
 ## Prerequisites
 
-- Linux ≥ 5.7 with `CONFIG_BPF_LSM=y` (Ubuntu 22.04+ ships this).
+- Linux >= 5.7 with `CONFIG_BPF_LSM=y` (Ubuntu 22.04+ and Debian 13 are
+  known-good targets).
 - `bpf` listed in `/sys/kernel/security/lsm`. If it is not there, append it
   to `lsm=` on the kernel command line (GRUB) and reboot. The
   [`whitelister/setup.sh check`](whitelister/setup.sh) helper detects this
   and prints the exact edit for your system.
 - Root (`CAP_BPF` + `CAP_SYS_ADMIN`) at load time.
 - Toolchain: `clang`, `llvm`, `libbpf-dev`, `libelf-dev`, `zlib1g-dev`,
-  `linux-tools-common`, `linux-headers-$(uname -r)`,
-  `linux-tools-$(uname -r)`.
+  matching `linux-headers-$(uname -r)`, and `bpftool`.
 
-`setup.sh deps` installs all of these via `apt`.
+`setup.sh deps` installs all of these via `apt`. It handles both Debian-style
+systems where `bpftool` is a direct package and Ubuntu-style systems where it
+is provided by `linux-tools-*`.
 
 ## Quick start
 
@@ -84,18 +87,36 @@ Denials are logged via `bpf_printk`:
 sudo cat /sys/kernel/debug/tracing/trace_pipe
 ```
 
+## GUI
+
+The optional GUI wraps the same loader command-line interface. It lets you add
+multiple `(comm, allow-prefix)` policy rows, starts/stops enforcement, restarts
+the loader for live policy updates, and tails `trace_pipe` for
+`whitelister: BLOCK` denial logs.
+
+```bash
+cd whitelister
+python3 gui.py
+```
+
+You need PyQt6 installed for the GUI, for example:
+
+```bash
+python3 -m pip install PyQt6
+```
+
 See [whitelister/README.md](whitelister/README.md) for the full enforcer
 documentation and limits (compile-time: 16 distinct comms, 128 prefixes
-total, 1024-byte path).
+total, 240-byte allow prefixes, 1024-byte resolved path buffer).
 
 ## Architecture & lookup model
 
-The BPF program holds two flat hash maps:
+The BPF program uses one hash map and one longest-prefix-match trie:
 
 | Map                | Type        | Key                                       | Purpose                                      |
 | ------------------ | ----------- | ----------------------------------------- | -------------------------------------------- |
 | `configured_comms` | `HASH`      | `char[16]`                                | Set: which comms have any policy at all.     |
-| `allow_prefixes`   | `HASH`      | `(char comm[16], char path[1024])`        | Allowed `(process, prefix)` pairs.           |
+| `allow_prefixes`   | `LPM_TRIE`  | `char comm[16] || path-prefix[240]`       | Longest-prefix match over `(process, path)`. |
 
 On every `open()` the LSM hook does:
 
@@ -103,14 +124,15 @@ On every `open()` the LSM hook does:
 2. Look up `configured_comms[comm]` (`O(1)`). If absent → return 0
    (the open proceeds; this comm has no policy).
 3. Resolve the absolute path with `bpf_d_path()`.
-4. Walk the resolved path's component chain in descending length order
-   (`/srv/ftp/file.txt` → `/srv/ftp` → `/srv` → `/`) and probe each
-   step in `allow_prefixes`. First hit → allow. No hit by `/` → deny
-   (`-EPERM` ⇒ `EACCES` to userspace).
+4. Build an LPM lookup key from `(comm || resolved_path)` and query
+   `allow_prefixes` for the longest stored prefix.
+5. Enforce the path-component boundary rule: `/srv/ftp` matches
+   `/srv/ftp/file.txt`, but not `/srv/ftp-secret`. A valid match allows;
+   no valid match denies (`-EPERM` to the caller).
 
-Cost is `O(D)` where `D` is the path's depth (typically 5–10), and
-**independent of how many `--allow` entries** the loader pushed in. This
-replaces an earlier linear-scan implementation whose cost grew with `N`;
+Cost is effectively constant with respect to the number of configured
+`--allow` entries: one comm hash probe, one LPM lookup, and one boundary-byte
+check. This replaces earlier lookup designs whose cost grew with policy size;
 the bench shows the difference directly via the `slope: X ns/entry`
 annotation in its plot legends.
 
@@ -143,11 +165,11 @@ saves two plots.
    measures the cost the LSM hook imposes on every *unrelated*
    process on the system.
 3. **comm-hit, allow** — whitelister configured with the bench's own
-   comm, allow-list of size N includes the target file. Hash-walk
-   ends in a hit.
+   comm, allow-list of size N includes the target file. The LPM lookup
+   finds a valid prefix.
 4. **comm-hit, deny** — same comm match, but the target file is
-   under no `--allow` prefix. Hash-walk reaches `/` without a hit;
-   the kernel returns `EACCES`.
+   under no `--allow` prefix. The LPM lookup finds no valid prefix;
+   the kernel returns `EPERM`.
 
 The bench process flips its own comm via `prctl(PR_SET_NAME)` *after*
 all libc / ld.so loads, so the LSM hook only matches the warmup +
