@@ -245,3 +245,17 @@ sudo PYTHON=~/.venv/bin/python ./bench/run_bench.sh
   caller's task context, so per-`open()` cost is what scales.
 - The `comm`-miss scenario reflects the cost every *non-target*
   process on the system pays once a whitelister is loaded.
+
+## Future work
+
+**Robust process identification.**
+Move from the spoofable process name (`task->comm`) to identification by executable file inode or cgroup.
+
+**Extended LSM hooks.**
+Intercept additional file access paths such as `mmap`, `execve`, and inherited file descriptors.
+
+**Fail-closed security.**
+Block access (`-EPERM`) on internal eBPF program failures instead of silently allowing.
+
+**Container support.**
+Implement namespace-based filtering for isolated policy enforcement in environments like Docker/K8s.

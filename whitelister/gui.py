@@ -27,6 +27,10 @@ from PyQt6.QtWidgets import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 BIN_PATH = SCRIPT_DIR / "build" / "whitelister"
 CONFIG_PATH = SCRIPT_DIR / "whitelister_config.h"
+SUDO_PASSWORD_HINT = (
+    "[*] If sudo asks for a password, enter it in the terminal where "
+    "you launched gui.py."
+)
 
 
 def read_config_limits():
@@ -312,6 +316,7 @@ class WhitelisterGUI(QMainWindow):
             "background-color: #c62828; color: white; border-radius: 5px;"
         )
         self.log_message("[*] Enforcement started.")
+        self.log_message(SUDO_PASSWORD_HINT)
 
     def start_whitelister_process(self):
         cmd = self.build_command()
