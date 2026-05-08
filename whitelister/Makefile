@@ -18,16 +18,16 @@ $(BUILD_DIR):
 $(VMLINUX): | $(BUILD_DIR)
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
 
-$(BPF_OBJ): whitelister.bpf.c $(VMLINUX)
+$(BPF_OBJ): whitelister.bpf.c whitelister_config.h $(VMLINUX)
 	$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) \
-	         -I$(BUILD_DIR) -c $< -o $@
+	         -I$(BUILD_DIR) -I. -c $< -o $@
 	$(LLVM_STRIP) -g $@
 
 $(SKEL): $(BPF_OBJ)
 	$(BPFTOOL) gen skeleton $< > $@
 
-$(BIN): whitelister.c $(SKEL)
-	$(CLANG) -g -O2 -Wall -I$(BUILD_DIR) $< -lbpf -lelf -lz -o $@
+$(BIN): whitelister.c whitelister_config.h $(SKEL)
+	$(CLANG) -g -O2 -Wall -I$(BUILD_DIR) -I. $< -lbpf -lelf -lz -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)

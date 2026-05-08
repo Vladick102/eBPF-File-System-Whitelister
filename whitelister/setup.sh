@@ -30,12 +30,34 @@ cmd_deps() {
     need_root deps
     info "installing build dependencies (apt)..."
     apt-get update
-    apt-get install -y \
-        clang llvm \
-        libbpf-dev libelf-dev zlib1g-dev \
-        bpftool linux-headers-"$(uname -r)" linux-tools-"$(uname -r)" ||
-        apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev \
-            bpftool linux-headers-"$(uname -r)"
+
+    local base_pkgs=(
+        clang llvm
+        libbpf-dev libelf-dev zlib1g-dev
+        linux-headers-"$(uname -r)"
+    )
+    local bpftool_pkgs=()
+
+    if apt-cache show bpftool >/dev/null 2>&1; then
+        bpftool_pkgs+=(bpftool)
+    elif apt-cache show linux-tools-"$(uname -r)" >/dev/null 2>&1; then
+        bpftool_pkgs+=(linux-tools-common linux-tools-"$(uname -r)")
+    elif apt-cache show linux-tools-common >/dev/null 2>&1; then
+        bpftool_pkgs+=(linux-tools-common)
+    fi
+
+    apt-get install -y "${base_pkgs[@]}" "${bpftool_pkgs[@]}"
+
+    local bpftool_bin
+    bpftool_bin="$(command -v bpftool || true)"
+    if [[ -z "$bpftool_bin" && -x /usr/sbin/bpftool ]]; then
+        bpftool_bin=/usr/sbin/bpftool
+    fi
+
+    if [[ -z "$bpftool_bin" ]]; then
+        die "bpftool not on PATH after install — try 'apt install bpftool' or your distro's linux-tools package manually"
+    fi
+    info "bpftool: $bpftool_bin ($("$bpftool_bin" version 2>&1 | head -1))"
     info "dependencies installed"
 }
 
@@ -61,9 +83,32 @@ cmd_check() {
         return 0
     fi
 
+    local new_chain="${lsms},bpf"
     cat >&2 <<EOF
 
 [!] 'bpf' is NOT in the active LSM chain — the whitelister will fail to attach.
+
+    Active chain : $lsms
+    Required     : $new_chain   (append ',bpf')
+
+To fix (one-time, then reboot):
+
+  1. sudo \$EDITOR /etc/default/grub
+  2. Find the GRUB_CMDLINE_LINUX_DEFAULT="..." line and add (or extend)
+     an lsm= argument with the full ordered chain:
+
+       lsm=$new_chain
+
+     Example:
+       GRUB_CMDLINE_LINUX_DEFAULT="quiet splash lsm=$new_chain"
+
+  3. sudo update-grub
+  4. sudo reboot
+  5. Verify:  cat /sys/kernel/security/lsm   (should contain 'bpf')
+
+Note: the order matters. Keep the existing LSMs in the same order as
+shown above and just append ',bpf' at the end — re-ordering 'capability'
+or 'lockdown' can break the boot.
 
 EOF
     exit 1
